@@ -35,7 +35,8 @@ passport.use(new LocalStrategy.Strategy(
           if (!user) return done(null, false, { message: 'Invalid credentials' })
             const ok = await validatePassword(user, password)
         if (!ok) return done(null, false, { message: 'Invalid credentials' })
-            return done(null, { id: user.id, email: user.email, role: user.role || 'user' })
+            // include username so req.user exposes it
+            return done(null, { id: user.id, username: user.username, email: user.email, role: user.role || 'user' })
     } catch (e) { return done(e) }
 }
 ))
@@ -44,7 +45,8 @@ passport.serializeUser((user, done) => done(null, user.id))
 passport.deserializeUser(async (id, done) => {
     const user = users.find(u => u.id === id)
     if (!user) return done(null, false)
-        done(null, { id: user.id, email: user.email, role: user.role || 'user' })
+        // include username when restoring session
+        done(null, { id: user.id, username: user.username, email: user.email, role: user.role || 'user' })
 })
 
 const app = express();
@@ -90,7 +92,8 @@ app.post('/api/login', (req, res, next) => {
     if (!user) return res.status(400).json({ error: info?.message || 'Login failed' })
     req.logIn(user, (err2) => {
       if (err2) return next(err2)
-      res.json({ id: user.id, email: user.email, role: user.role })
+      // return username as part of the login response
+      res.json({ id: user.id, username: user.username, email: user.email, role: user.role })
     })
   })(req, res, next)
 })
@@ -106,6 +109,7 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', (req, res) => {
   if (!req.isAuthenticated()) return res.json(null)
+  // req.user now includes username
   res.json(req.user)
 })
 
