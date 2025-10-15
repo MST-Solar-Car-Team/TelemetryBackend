@@ -11,11 +11,13 @@ const users = [
     id: '1',
     username: 'user1',
     password: '$2a$12$aVafeJDa1ZCiEbNqz7wpBe1sGIh1NiqlM99pmUFhtWEDFLbPIPOX2', // hashed password for 'password1'
+    role: 'admin'
   },
   {
     id: '2',
     username: 'user2',
     password: '$2a$12$dfwz.fwKTvg19YvQMnnmu.F02P1eakBFuohICrFEK6pcGItQlzx9S', // hashed password for 'password2'
+    role: 'user'
   },
 ];
 
@@ -36,7 +38,7 @@ passport.use(new LocalStrategy.Strategy(
             const ok = await validatePassword(user, password)
         if (!ok) return done(null, false, { message: 'Invalid credentials' })
             // include username so req.user exposes it
-            return done(null, { id: user.id, username: user.username, email: user.email, role: user.role || 'user' })
+            return done(null, { id: user.id, username: user.username, role: user.role || 'user' })
     } catch (e) { return done(e) }
 }
 ))
@@ -46,7 +48,7 @@ passport.deserializeUser(async (id, done) => {
     const user = users.find(u => u.id === id)
     if (!user) return done(null, false)
         // include username when restoring session
-        done(null, { id: user.id, username: user.username, email: user.email, role: user.role || 'user' })
+        done(null, { id: user.id, username: user.username, role: user.role || 'user' })
 })
 
 const app = express();
@@ -67,7 +69,7 @@ app.use(session({
     httpOnly: true,
     secure: false, // change to true when we https
     sameSite: 'lax',
-    maxAge: 1000 * 60 * 60 * 8
+    maxAge: 1000 * 60 * 60 * 8 // 8 hours
   }
 }))
 
@@ -111,6 +113,18 @@ app.get('/api/me', (req, res) => {
   if (!req.isAuthenticated()) return res.json(null)
   // req.user now includes username
   res.json(req.user)
+})
+
+// ---- Protected telemetry/file routes ----
+app.get('/api/files/:id', ensureAuth, async (req, res) => {
+  const fileId = req.params.id
+
+  res.sendFile(`./files/${fileId}.json`, { root: '.' })
+})
+
+// admin-only endpoint, change later
+app.get('/api/admin/telemetry', requireRole('admin'), (req, res) => {
+  res.json({ secret: 'telemetry controls' })
 })
 
 app.listen(3000, () => console.log('API on http://localhost:3000'))
