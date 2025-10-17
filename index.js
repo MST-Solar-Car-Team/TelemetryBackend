@@ -4,6 +4,10 @@ import passport from 'passport'
 import LocalStrategy from 'passport-local'
 import bcrypt from 'bcryptjs'
 import cors from 'cors'
+import duckdb from 'duckdb'
+
+const DB = new duckdb.Database(':memory:')
+const CONNECTION = DB.connect()
 
 // users database
 const users = [
@@ -21,6 +25,9 @@ const users = [
   },
 ];
 
+function parquetPathFromId(id) {
+    return `./data/telemetry/${id}.parquet`
+}
 
 async function findUserByUsername(username) {
     return users.find(u => u.username === username) || null
@@ -115,11 +122,56 @@ app.get('/api/me', (req, res) => {
   res.json(req.user)
 })
 
-// ---- Protected telemetry/file routes ----
-app.get('/api/files/:id', ensureAuth, async (req, res) => {
-  const fileId = req.params.id
+// --- parquet file metadata, not used yet/at all
+app.get('/api/files/:id/meta', ensureAuth, async (req, res, next) => {
+  try {
+    const id = req.params.id
+    const path = parquetPathFromId(id)
+    const rows = await CONNECTION.all(`
+      SELECT column_name, data_type
+      FROM parquet_schema('${path}')
+    `)
+    const count = await CONNECTION.all(`SELECT COUNT(*) AS n FROM '${path}'`)
+    res.json({ columns: rows, rows: count[0].n })
+  } catch (e) { next(e) }
+})
 
-  res.sendFile(`./files/${fileId}.json`, { root: '.' })
+// --- arrow streaming (default) or JSON for fallback
+app.get('/api/files/:id/data', ensureAuth, async (req, res, next) => {
+  try {
+    const id = req.params.id
+    const path = parquetPathFromId(id)
+
+    // query parameters
+    const select = (req.query.select ?? '*').toString()
+    const where  = (req.query.where  ?? 'TRUE').toString()
+    const limit  = Math.min(parseInt(req.query.limit ?? '50000', 10), 200000) // safety cap
+    const fmt    = (req.query.format ?? 'arrow').toString()    // 'arrow' | 'json'
+    const order  = (req.query.order  ?? '').toString()
+
+    const orderClause = order ? `ORDER BY ${order}` : ''
+    const sql = `
+      SELECT ${select}
+      FROM '${path}'
+      WHERE ${where}
+      ${orderClause}
+      LIMIT ${limit}
+    `
+
+    if (fmt === 'json') {
+      const rows = await CONNECTION.all(sql)
+      res.json(rows)
+      return
+    }
+
+    // arrow stream response
+    res.setHeader('Content-Type', 'application/vnd.apache.arrow.stream')
+    // duckdb node api: each chunk is an Arrow RecordBatch in IPC format
+    await CONNECTION.stream(sql, (chunk) => {
+      res.write(Buffer.from(chunk)) // chunk is a Uint8Array
+    })
+    res.end()
+  } catch (e) { next(e) }
 })
 
 // admin-only endpoint, change later
