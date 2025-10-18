@@ -1,12 +1,13 @@
 {
   "type": "module",
   "dependencies": {
+    "@duckdb/node-api": "^1.4.1-r.3",
     "apache-arrow": "^21.1.0",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
-    "duckdb": "^1.4.1",
     "express": "^5.1.0",
     "express-session": "^1.18.2",
+    "parquetjs-lite": "^0.8.7",
     "passport": "^0.7.0",
     "passport-local": "^1.0.0"
   }

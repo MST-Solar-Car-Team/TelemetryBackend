@@ -4,10 +4,11 @@ import passport from 'passport'
 import LocalStrategy from 'passport-local'
 import bcrypt from 'bcryptjs'
 import cors from 'cors'
-import duckdb from 'duckdb'
+import { DuckDBInstance } from '@duckdb/node-api';
+import fs from 'fs'
 
-const DB = new duckdb.Database(':memory:')
-const CONNECTION = DB.connect()
+const instance = await DuckDBInstance.create(':memory:');
+const connection = await instance.connect();
 
 // users database
 const users = [
@@ -122,17 +123,29 @@ app.get('/api/me', (req, res) => {
   res.json(req.user)
 })
 
+// --- list available parquet files
+app.get('/api/files', ensureAuth, async (req, res, next) => {
+  try {
+    const files = await fs.promises.readdir('./data/telemetry')
+    const parquetFiles = files
+      .filter(f => f.endsWith('.parquet'))
+      .map(f => f.replace(/\.parquet$/i, ''))
+    res.json(parquetFiles)
+  } catch (e) { next(e) }
+})
+
 // --- parquet file metadata, not used yet/at all
 app.get('/api/files/:id/meta', ensureAuth, async (req, res, next) => {
   try {
     const id = req.params.id
     const path = parquetPathFromId(id)
-    const rows = await CONNECTION.all(`
+    const rows = await connection.run(`
       SELECT column_name, data_type
       FROM parquet_schema('${path}')
     `)
-    const count = await CONNECTION.all(`SELECT COUNT(*) AS n FROM '${path}'`)
-    res.json({ columns: rows, rows: count[0].n })
+    let rowsw = await rows.getRows()
+    const count = await connection.run(`SELECT COUNT(*) AS n FROM read_parquet('${path}')`).getRows()
+    res.json({ columns: rowsw, rows: count[0].n })
   } catch (e) { next(e) }
 })
 
@@ -141,6 +154,9 @@ app.get('/api/files/:id/data', ensureAuth, async (req, res, next) => {
   try {
     const id = req.params.id
     const path = parquetPathFromId(id)
+    if (fs.existsSync(path) === false) {
+      return res.status(404).json({ error: 'File not found' })
+    }
 
     // query parameters
     const select = (req.query.select ?? '*').toString()
@@ -159,18 +175,21 @@ app.get('/api/files/:id/data', ensureAuth, async (req, res, next) => {
     `
 
     if (fmt === 'json') {
-      const rows = await CONNECTION.all(sql)
-      res.json(rows)
+      const rows = await connection.run(sql)
+      let rowsw = await rows.getRows()
+      console.log('Returning JSON data', rowsw)
+      res.json(rowsw)
       return
     }
 
     // arrow stream response
-    res.setHeader('Content-Type', 'application/vnd.apache.arrow.stream')
+    // console.log('Streaming Arrow data with SQL:', sql)
     // duckdb node api: each chunk is an Arrow RecordBatch in IPC format
-    await CONNECTION.stream(sql, (chunk) => {
-      res.write(Buffer.from(chunk)) // chunk is a Uint8Array
-    })
-    res.end()
+    const reader = await connection.streamAndReadAll(sql)
+
+    const rows = reader.getRowObjectsJson();  // or getColumnsObjectJson()
+    const buf  = Buffer.from(JSON.stringify(rows));
+    res.end(buf);
   } catch (e) { next(e) }
 })
 
