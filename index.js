@@ -103,7 +103,7 @@ app.post('/api/login', (req, res, next) => {
     req.logIn(user, (err2) => {
       if (err2) return next(err2)
       // return username as part of the login response
-      res.json({ id: user.id, username: user.username, email: user.email, role: user.role })
+      res.json({ id: user.id, username: user.username, role: user.role })
     })
   })(req, res, next)
 })
