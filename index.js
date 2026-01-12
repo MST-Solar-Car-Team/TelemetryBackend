@@ -6,9 +6,12 @@ import bcrypt from 'bcryptjs'
 import cors from 'cors'
 import { DuckDBInstance } from '@duckdb/node-api';
 import fs from 'fs'
+import path from 'path'
 
 const instance = await DuckDBInstance.create(':memory:');
 const connection = await instance.connect();
+
+const telemetryDir = path.resolve('./data/telemetry')
 
 // users database
 const users = [
@@ -26,8 +29,101 @@ const users = [
   },
 ];
 
-function parquetPathFromId(id) {
-    return `./data/telemetry/${id}.parquet`
+const SAFE_ID_RE = /^[A-Za-z0-9_-]+$/
+const MAX_LIMIT = 200000
+
+function resolveParquetPath(id) {
+  if (!SAFE_ID_RE.test(id)) return null
+  const filePath = path.resolve(telemetryDir, `${id}.parquet`)
+  if (!filePath.startsWith(`${telemetryDir}${path.sep}`)) return null
+  return filePath
+}
+
+function quoteIdent(name) {
+  return `"${name.replace(/"/g, '""')}"`
+}
+
+function escapeSqlString(value) {
+  return value.replace(/'/g, "''")
+}
+
+async function getParquetColumns(filePath) {
+  const escapedPath = escapeSqlString(filePath)
+  const rows = await connection.run(`
+    SELECT column_name
+    FROM parquet_schema('${escapedPath}')
+  `)
+  const rowsw = await rows.getRows()
+  return rowsw.map(row => row.column_name)
+}
+
+function parseSelect(selectRaw, allowedColumns) {
+  const trimmed = (selectRaw ?? '').toString().trim()
+  if (!trimmed || trimmed === '*') return '*'
+  const cols = trimmed.split(',').map(col => col.trim()).filter(Boolean)
+  if (!cols.length) return '*'
+  const invalid = cols.filter(col => !allowedColumns.has(col))
+  if (invalid.length) {
+    throw new Error(`Invalid select columns: ${invalid.join(', ')}`)
+  }
+  return cols.map(col => quoteIdent(col)).join(', ')
+}
+
+function parseOrder(orderRaw, allowedColumns) {
+  const trimmed = (orderRaw ?? '').toString().trim()
+  if (!trimmed) return ''
+  const clauses = trimmed.split(',').map(clause => clause.trim()).filter(Boolean)
+  if (!clauses.length) return ''
+  const parsedClauses = clauses.map(clause => {
+    const parts = clause.split(/\s+/).filter(Boolean)
+    if (parts.length === 0 || parts.length > 2) {
+      throw new Error('Invalid order clause')
+    }
+    const column = parts[0]
+    if (!allowedColumns.has(column)) {
+      throw new Error(`Invalid order column: ${column}`)
+    }
+    let direction = ''
+    if (parts[1]) {
+      const upper = parts[1].toUpperCase()
+      if (upper !== 'ASC' && upper !== 'DESC') {
+        throw new Error(`Invalid order direction: ${parts[1]}`)
+      }
+      direction = ` ${upper}`
+    }
+    return `${quoteIdent(column)}${direction}`
+  })
+  return `ORDER BY ${parsedClauses.join(', ')}`
+}
+
+function parseWhereValue(raw) {
+  const trimmed = raw.trim()
+  if (/^[-+]?\d+(\.\d+)?$/.test(trimmed)) return trimmed
+  if (
+    (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+    (trimmed.startsWith('"') && trimmed.endsWith('"'))
+  ) {
+    const inner = trimmed.slice(1, -1)
+    return `'${inner.replace(/'/g, "''")}'`
+  }
+  throw new Error('Invalid where value')
+}
+
+function parseWhere(whereRaw, allowedColumns) {
+  const trimmed = (whereRaw ?? '').toString().trim()
+  if (!trimmed || trimmed.toUpperCase() === 'TRUE') return 'TRUE'
+  const clauses = trimmed.split(/\s+AND\s+/i).map(clause => clause.trim()).filter(Boolean)
+  const parsedClauses = clauses.map(clause => {
+    const match = clause.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(=|!=|<=|>=|<|>)\s*(.+)$/)
+    if (!match) throw new Error('Invalid where clause')
+    const [, column, operator, valueRaw] = match
+    if (!allowedColumns.has(column)) {
+      throw new Error(`Invalid where column: ${column}`)
+    }
+    const value = parseWhereValue(valueRaw)
+    return `${quoteIdent(column)} ${operator} ${value}`
+  })
+  return parsedClauses.join(' AND ')
 }
 
 async function findUserByUsername(username) {
@@ -126,7 +222,7 @@ app.get('/api/me', (req, res) => {
 // --- list available parquet files
 app.get('/api/files', ensureAuth, async (req, res, next) => {
   try {
-    const files = await fs.promises.readdir('./data/telemetry')
+    const files = await fs.promises.readdir(telemetryDir)
     const parquetFiles = files
       .filter(f => f.endsWith('.parquet'))
       .map(f => f.replace(/\.parquet$/i, ''))
@@ -138,13 +234,20 @@ app.get('/api/files', ensureAuth, async (req, res, next) => {
 app.get('/api/files/:id/meta', ensureAuth, async (req, res, next) => {
   try {
     const id = req.params.id
-    const path = parquetPathFromId(id)
+    const path = resolveParquetPath(id)
+    if (!path) {
+      return res.status(400).json({ error: 'Invalid file id' })
+    }
+    if (fs.existsSync(path) === false) {
+      return res.status(404).json({ error: 'File not found' })
+    }
+    const escapedPath = escapeSqlString(path)
     const rows = await connection.run(`
       SELECT column_name, data_type
-      FROM parquet_schema('${path}')
+      FROM parquet_schema('${escapedPath}')
     `)
     let rowsw = await rows.getRows()
-    const count = await connection.run(`SELECT COUNT(*) AS n FROM read_parquet('${path}')`).getRows()
+    const count = await connection.run(`SELECT COUNT(*) AS n FROM read_parquet('${escapedPath}')`).getRows()
     res.json({ columns: rowsw, rows: count[0].n })
   } catch (e) { next(e) }
 })
@@ -153,7 +256,10 @@ app.get('/api/files/:id/meta', ensureAuth, async (req, res, next) => {
 app.get('/api/files/:id/data', ensureAuth, async (req, res, next) => {
   try {
     const id = req.params.id
-    const path = parquetPathFromId(id)
+    const path = resolveParquetPath(id)
+    if (!path) {
+      return res.status(400).json({ error: 'Invalid file id' })
+    }
     if (fs.existsSync(path) === false) {
       return res.status(404).json({ error: 'File not found' })
     }
@@ -161,15 +267,29 @@ app.get('/api/files/:id/data', ensureAuth, async (req, res, next) => {
     // query parameters
     const select = (req.query.select ?? '*').toString()
     const where  = (req.query.where  ?? 'TRUE').toString()
-    const limit  = Math.min(parseInt(req.query.limit ?? '50000', 10), 200000) // safety cap
+    const limitRaw = parseInt(req.query.limit ?? '50000', 10)
+    const limit  = Number.isFinite(limitRaw) && limitRaw >= 0
+      ? Math.min(limitRaw, MAX_LIMIT)
+      : 50000
     const fmt    = (req.query.format ?? 'arrow').toString()    // 'arrow' | 'json'
     const order  = (req.query.order  ?? '').toString()
 
-    const orderClause = order ? `ORDER BY ${order}` : ''
+    const allowedColumns = new Set(await getParquetColumns(path))
+    let selectClause
+    let whereClause
+    let orderClause
+    try {
+      selectClause = parseSelect(select, allowedColumns)
+      whereClause = parseWhere(where, allowedColumns)
+      orderClause = parseOrder(order, allowedColumns)
+    } catch (error) {
+      return res.status(400).json({ error: error.message || 'Invalid query parameters' })
+    }
+    const escapedPath = escapeSqlString(path)
     const sql = `
-      SELECT ${select}
-      FROM '${path}'
-      WHERE ${where}
+      SELECT ${selectClause}
+      FROM '${escapedPath}'
+      WHERE ${whereClause}
       ${orderClause}
       LIMIT ${limit}
     `
