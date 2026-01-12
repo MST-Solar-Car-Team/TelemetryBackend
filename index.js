@@ -47,14 +47,24 @@ function escapeSqlString(value) {
   return value.replace(/'/g, "''")
 }
 
-async function getParquetColumns(filePath) {
+async function getParquetSchema(filePath) {
   const escapedPath = escapeSqlString(filePath)
-  const rows = await connection.run(`
-    SELECT column_name
-    FROM parquet_schema('${escapedPath}')
-  `)
+  const rows = await connection.run(`DESCRIBE SELECT * FROM read_parquet('${escapedPath}')`)
   const rowsw = await rows.getRows()
-  return rowsw.map(row => row.column_name)
+  return rowsw.map(row => {
+    if (Array.isArray(row)) {
+      return { column_name: row[0], data_type: row[1] }
+    }
+    return {
+      column_name: row.column_name ?? row.name,
+      data_type: row.data_type ?? row.type
+    }
+  })
+}
+
+async function getParquetColumns(filePath) {
+  const schema = await getParquetSchema(filePath)
+  return schema.map(row => row.column_name).filter(Boolean)
 }
 
 function parseSelect(selectRaw, allowedColumns) {
@@ -242,13 +252,9 @@ app.get('/api/files/:id/meta', ensureAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'File not found' })
     }
     const escapedPath = escapeSqlString(path)
-    const rows = await connection.run(`
-      SELECT column_name, data_type
-      FROM parquet_schema('${escapedPath}')
-    `)
-    let rowsw = await rows.getRows()
+    const schema = await getParquetSchema(path)
     const count = await connection.run(`SELECT COUNT(*) AS n FROM read_parquet('${escapedPath}')`).getRows()
-    res.json({ columns: rowsw, rows: count[0].n })
+    res.json({ columns: schema, rows: count[0].n })
   } catch (e) { next(e) }
 })
 
